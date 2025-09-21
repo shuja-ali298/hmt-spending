@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse, json, os, re
 from datetime import date, datetime
+from urllib.parse import urljoin
 from dateutil.relativedelta import relativedelta
 import requests
 from bs4 import BeautifulSoup
@@ -35,10 +36,14 @@ def month_iter(start: date, end: date):
 
 def find_asset_xlsx_or_csv(html: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
-    a = soup.find("a", href=re.compile(r"/media/.+\\.(xlsx|csv)$"))
-    if a and a.has_attr("href"):
-        href = a["href"]
-        return href if href.startswith("http") else "https://www.gov.uk"+href
+
+    def normalize(href: str) -> str:
+        return urljoin("https://www.gov.uk", href)
+
+    for a in soup.select("a.gem-c-attachment__link, a.govuk-link.gem-c-attachment__link"):
+        href = a.get("href", "")
+        if re.search(r"\.(xlsx|csv)(?:\?.*)?$", href, flags=re.I):
+            return normalize(href)
     return None
 
 def smart_find(cols_lower, candidates):
