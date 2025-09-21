@@ -5,7 +5,114 @@ from urllib.parse import urljoin
 from dateutil.relativedelta import relativedelta
 import requests
 from bs4 import BeautifulSoup
+import re
 import pandas as pd
+import numpy as np
+
+def _canon(s: str) -> str:
+    """Lowercase, strip, collapse spaces, remove non-alphanumerics."""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    # remove everything except a-z 0-9
+    return re.sub(r"[^a-z0-9]", "", s)
+
+def smart_find(cols_lower, candidates):
+    """
+    Try to match column headers against candidate aliases, allowing for
+    punctuation/parentheses symbols like 'Amount (GBP)', 'Amount £', etc.
+    """
+    # canonicalize once
+    canon_cols = [_canon(c) for c in cols_lower]
+    cand_canon = [_canon(c) for c in candidates]
+
+    # exact canonical match
+    for cc in cand_canon:
+        if cc in canon_cols:
+            return cols_lower[canon_cols.index(cc)]
+
+    # partial contains (for cases like 'amountgbpnet' vs 'amountgbp')
+    for i, cc in enumerate(cand_canon):
+        for j, colc in enumerate(canon_cols):
+            if cc and cc in colc:
+                return cols_lower[j]
+
+    return None
+
+def _parse_amount_series(s: pd.Series) -> pd.Series:
+    """
+    Convert many currency string formats to float.
+    Handles:
+      - commas, £ symbols, spaces
+      - accounting negatives (parentheses)
+      - en/em dashes, trailing minus
+      - numeric columns already read as float/int
+    """
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    # to string
+    t = s.astype(str)
+
+    # normalize unicode dashes to ASCII minus
+    t = t.str.replace("\u2012", "-", regex=False)\
+         .str.replace("\u2013", "-", regex=False)\
+         .str.replace("\u2014", "-", regex=False)
+
+    # strip currency symbols, commas, spaces
+    t = (t.str.replace("£", "", regex=False)
+           .str.replace(",", "", regex=False)
+           .str.replace("\u00A0", " ", regex=False)  # nbsp
+           .str.strip())
+
+    # accounting negatives: (1234.56) -> -1234.56
+    t = t.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+
+    # trailing minus: 1234- -> -1234
+    t = t.str.replace(r"^(\d+(?:\.\d+)?)\-$", r"-\1", regex=True)
+
+    # extract the first numeric-looking token, allow optional decimal
+    # (don’t double-escape the backslashes!)
+    num = t.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+
+    return pd.to_numeric(num, errors="coerce")
+
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    cols_lower = [str(c).strip() for c in df.columns]
+    mapping = {}
+
+    # widen aliases for amount
+    COL_MAPS["amount_gbp"] = [
+        "amount", "amount gbp", "amount (gbp)", "amount( gbp )", "amount £",
+        "£", "gbp", "net amount", "net amount gbp", "value", "net value",
+        "amount_gbp", "amt", "gross amount", "line amount"
+    ]
+
+    for k, aliases in COL_MAPS.items():
+        f = smart_find(cols_lower, aliases)
+        if f:
+            mapping[k] = df.columns[cols_lower.index(f)]
+
+    out = pd.DataFrame(index=df.index.copy())
+
+    # copy mapped columns if found; else fill with NA
+    for k in COL_MAPS.keys():
+        out[k] = df[mapping[k]] if k in mapping else pd.NA
+
+    # date parse (only if present)
+    if "date" in out and out["date"].notna().any():
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # amount parse (robust)
+    if "amount_gbp" in out:
+        out["amount_gbp"] = _parse_amount_series(out["amount_gbp"])
+
+    # basic cleanup: drop rows that are completely empty on key fields
+    key_cols = [c for c in ["supplier", "amount_gbp", "date", "description"] if c in out.columns]
+    if key_cols:
+        out = out[~out[key_cols].isna().all(axis=1)]
+
+    return out
+
 
 COL_MAPS = {
     "department_family": ["department family","department","departmentfamily"],
