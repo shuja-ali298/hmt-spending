@@ -1,0 +1,35 @@
+name: fetch-hmt-spend-data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start month (YYYY-MM)"
+        required: false
+      end:
+          description: "End month inclusive (YYYY-MM)"
+          required: false
+  schedule:
+    # 08:10 UTC on the 3rd of each month (≈09:10 London during GMT)
+    - cron: "10 8 3 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-hmt-spend-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
