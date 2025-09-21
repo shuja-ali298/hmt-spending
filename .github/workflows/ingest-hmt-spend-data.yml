@@ -38,7 +38,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/fetch_hmt_spend_data.py --start "${{ github.event.inputs.start }}" -- end "${{ github.event.inputs.end }}"
+          python scripts/fetch_hmt_spend_data.py --start "${{ github.event.inputs.start }}" --end "${{ github.event.inputs.end }}"
 
       - name: Commit and push changes
         run: |
