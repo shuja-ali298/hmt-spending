@@ -15,20 +15,20 @@ COL_MAPS = {
     "expense_type": ["expense type","expenditure type","type"],
     "expense_area": ["expense area","cost centre","expensearea"],
     "supplier": ["supplier","vendor","supplier name"],
-    "transaction_number": ["voucher number","transaction number","transaction no","transaction id"],
+    "transaction_number": ["voucher number","transaction number","transaction no","transaction id","voucher","doc no"],
     "amount_gbp": [
-        "amount", "amount gbp", "amount (gbp)", "amount £", "amount(£)",
-        "net amount", "net amount gbp", "net amount (£)", "net value",
-        "value", "line amount", "line value", "gross amount",
-        "amount inc vat", "amount (inc vat)", "amt", "amount_gbp", "amountgbp"
+        "amount","amount gbp","amount (gbp)","amount£","amount £","£",
+        "gbp","net amount","net amount gbp","value","net value",
+        "line amount","gross amount","transaction amount","amount (net)"
     ],
-    "description": ["publication description","description","item text","narrative"],
+    "description": ["publication description","description","item text","narrative","details"],
     "supplier_postcode": ["supplier postcode","postal code","post code","postcode"],
     "supplier_type": ["supplier type","supplier category"],
-    "contract_number": ["contract number","contract no","po number","purchase order"],
-    "project_code": ["project code","project","cost code"],
+    "contract_number": ["contract number","contract no","po number","purchase order","order no","order number"],
+    "project_code": ["project code","project","cost code","cost centre code"],
     "item_text": ["item text"],
 }
+
 PUB_URL_TMPL = "https://www.gov.uk/government/publications/hmt-spend-greater-than-25000-{month}-{year}"
 MONTHS = ["january","february","march","april","may","june","july","august","september","october","november","december"]
 HEADERS = {"User-Agent":"github-action-hmt-spend-json/1.0 (+https://github.com/)"}
@@ -53,46 +53,61 @@ def find_asset_xlsx_or_csv(html: str) -> str | None:
     return None
 
 def _canon(s: str) -> str:
+    """Lower, trim, collapse spaces, drop non-alphanumerics."""
     s = str(s).strip().lower()
     s = re.sub(r"\s+", " ", s)
-    return re.sub(r"[^a-z0-9]", "", s)  # only a-z0-9
+    return re.sub(r"[^a-z0-9]", "", s)
 
-def smart_find(cols_raw, candidates):
+def smart_find(cols, candidates):
     """
-    Canonicalize headers and try exact/partial matches against candidate aliases.
+    Canonical & partial matching for headers (e.g. 'Amount (GBP)', 'Amount £').
     """
-    cols_canon = [_canon(c) for c in cols_raw]
+    cols = [str(c) for c in cols]
+    canon_cols = [_canon(c) for c in cols]
     cand_canon = [_canon(c) for c in candidates]
 
     # exact canonical match
     for cc in cand_canon:
-        if cc in cols_canon:
-            return cols_raw[cols_canon.index(cc)]
+        if cc in canon_cols:
+            return cols[canon_cols.index(cc)]
 
-    # partial contains (e.g. 'amountgbp' inside 'amountgbpnet')
+    # partial contains (handles 'amountgbpnet' vs 'amountgbp', etc.)
     for i, cc in enumerate(cand_canon):
-        if not cc:
-            continue
-        for j, colc in enumerate(cols_canon):
-            if cc in colc:
-                return cols_raw[j]
+        for j, colc in enumerate(canon_cols):
+            if cc and cc in colc:
+                return cols[j]
     return None
 
-def _parse_amount_series(s: pd.Series) -> pd.Series:
+def read_any_table(tmp_path: str, asset_url: str) -> pd.DataFrame:
     """
-    Convert diverse currency string formats to float.
+    Try multiple encodings for CSV. Excel via pandas handles encoding internally.
     """
+    if asset_url.lower().endswith(".csv"):
+        for enc in ("utf-8-sig", "cp1252", "latin1"):
+            try:
+                return pd.read_csv(tmp_path, encoding=enc, encoding_errors="replace")
+            except Exception:
+                continue
+        # last resort: no encoding hint
+        return pd.read_csv(tmp_path, encoding_errors="replace")
+    else:
+        xls = pd.ExcelFile(tmp_path)   # engine auto-detected
+        sheet = xls.sheet_names[0]
+        return pd.read_excel(xls, sheet_name=sheet)
+
+def parse_amount_series(s: pd.Series) -> pd.Series:
+    """Convert many currency formats to float with unicode cleanup."""
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
 
     t = s.astype(str)
 
-    # normalize unicode dashes to ASCII minus
+    # normalise unicode dashes to ASCII minus
     t = (t.str.replace("\u2012", "-", regex=False)
            .str.replace("\u2013", "-", regex=False)
            .str.replace("\u2014", "-", regex=False))
 
-    # strip currency symbols, commas, NBSPs, trim
+    # strip currency symbols, commas, NBSP, and trim
     t = (t.str.replace("£", "", regex=False)
            .str.replace(",", "", regex=False)
            .str.replace("\u00A0", " ", regex=False)
@@ -108,40 +123,38 @@ def _parse_amount_series(s: pd.Series) -> pd.Series:
     num = t.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
     return pd.to_numeric(num, errors="coerce")
 
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    # widen aliases for 'amount' just before mapping
-    COL_MAPS["amount_gbp"] = [
-        "amount", "amount gbp", "amount (gbp)", "amount £", "£", "gbp",
-        "net amount", "net amount gbp", "net value", "value",
-        "gross amount", "line amount", "amount_gbp", "amt"
-    ]
 
-    cols_raw = [str(c) for c in df.columns]
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(df.columns)
     mapping = {}
     for k, aliases in COL_MAPS.items():
-        found = smart_find(cols_raw, aliases)
-        if found:
-            mapping[k] = found
+        f = smart_find(cols, aliases)
+        if f:
+            mapping[k] = f
 
     out = pd.DataFrame(index=df.index.copy())
+
+    # copy mapped columns; keep a raw copy of amount for debugging
     for k in COL_MAPS.keys():
-        out[k] = df[mapping[k]] if k in mapping else pd.NA
+        if k in mapping:
+            out[k] = df[mapping[k]]
+        else:
+            out[k] = pd.NA
 
-    # parse date if present
-    if "date" in out and out["date"].notna().any():
-        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if "amount_gbp" in mapping:
+        out["amount_raw"] = df[mapping["amount_gbp"]]
 
-    # parse amount robustly
+    # date parse: UK style in historic files
+    if "date" in out:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d")
+
     if "amount_gbp" in out:
-        out["amount_gbp"] = _parse_amount_series(out["amount_gbp"])
+        out["amount_gbp"] = parse_amount_series(out["amount_gbp"])
 
-    # drop rows utterly empty on key fields
+    # drop rows that are entirely empty on key fields
     key_cols = [c for c in ["supplier", "amount_gbp", "date", "description"] if c in out.columns]
     if key_cols:
         out = out[~out[key_cols].isna().all(axis=1)]
-
-    # optional: tiny debug to verify mapping (comment out once happy)
-    # print("Header mapping:", mapping)
 
     return out
 
@@ -153,14 +166,9 @@ def save_month_json(dt: date, asset_url: str):
     tmp = "/tmp/hmt_asset"
     open(tmp,"wb").write(r.content)
 
-    if asset_url.lower().endswith(".csv"):
-        df = pd.read_csv(tmp)
-    else:
-        xls = pd.ExcelFile(tmp)
-        sheet = xls.sheet_names[0]
-        df = pd.read_excel(xls, sheet_name=sheet)
-
+    df = read_any_table(tmp, asset_url)      # <— use the fallback reader
     norm = normalize_dataframe(df)
+
     meta = {
         "source": asset_url,
         "publisher": "HM Treasury",
